@@ -1,0 +1,43 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+
+# Uploaded resumes and private files
+backend/uploads/
+uploads/
+
+# Node.js
+node_modules/
+
+# Next.js
+.next/
+out/
+build/
+
+# Database files
+*.sqlite3
+*.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Deployment
+.vercel/

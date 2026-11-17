@@ -1,6 +1,10 @@
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 import uuid
+import urllib.request
+import urllib.error
+from urllib.parse import quote
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Body
@@ -32,13 +36,24 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# CORS configuration
+allowed_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "")
+
+if frontend_origin:
+    allowed_origins.extend(
+        origin.strip()
+        for origin in frontend_origin.split(",")
+        if origin.strip()
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "*"
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,6 +66,89 @@ app.add_middleware(
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+SUPABASE_STORAGE_BUCKET = "resumes"
+
+
+def upload_resume_to_storage(local_path: Path, object_name: str) -> str:
+    """Upload a resume to the private Supabase Storage bucket."""
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    secret_key = os.getenv("SUPABASE_SECRET_KEY")
+
+    if not supabase_url or not secret_key:
+        raise RuntimeError("Supabase Storage environment variables are missing.")
+
+    url = (
+        f"{supabase_url.rstrip('/')}/storage/v1/object/"
+        f"{SUPABASE_STORAGE_BUCKET}/{quote(object_name, safe='/')}"
+    )
+
+    request = urllib.request.Request(
+        url,
+        data=local_path.read_bytes(),
+        headers={
+            "apikey": secret_key,
+            "Authorization": f"Bearer {secret_key}",
+            "Content-Type": (
+                "application/pdf"
+                if local_path.suffix.lower() == ".pdf"
+                else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if response.status not in (200, 201):
+                raise RuntimeError("Supabase resume upload failed.")
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supabase upload failed: {details}") from error
+
+    return f"supabase:{SUPABASE_STORAGE_BUCKET}/{object_name}"
+
+
+def delete_resume_from_storage(file_path: str) -> None:
+    """Delete a resume from Supabase Storage or legacy local storage."""
+
+    if file_path.startswith("supabase:"):
+        supabase_url = os.getenv("SUPABASE_URL")
+        secret_key = os.getenv("SUPABASE_SECRET_KEY")
+
+        if not supabase_url or not secret_key:
+            raise RuntimeError("Supabase Storage environment variables are missing.")
+
+        bucket_and_name = file_path[len("supabase:"):]
+        bucket, object_name = bucket_and_name.split("/", 1)
+
+        url = (
+            f"{supabase_url.rstrip('/')}/storage/v1/object/"
+            f"{bucket}/{quote(object_name, safe='/')}"
+        )
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "apikey": secret_key,
+                "Authorization": f"Bearer {secret_key}",
+            },
+            method="DELETE",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=30):
+                pass
+        except urllib.error.HTTPError as error:
+            details = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Supabase resume deletion failed: {details}") from error
+
+    else:
+        # Support existing resumes stored on local disk.
+        local_path = Path(file_path)
+        if local_path.exists():
+            local_path.unlink()
 
 
 # --------------------------------------------------
@@ -204,12 +302,18 @@ async def upload_resume(
     saved_filename = f"{candidate_id}{file_extension}"
     saved_path = UPLOAD_DIR / saved_filename
 
+    cloud_file_path = None
+    candidate_committed = False
+
     try:
-        # Save resume file permanently on disk
+        # Temporary local copy: the existing NLP parser reads from a file path.
         saved_path.write_bytes(contents)
 
-        # Parse resume through NLP extraction engine
+        # Keep the existing resume extraction behavior.
         parsed = parse_resume(str(saved_path))
+
+        # Store the original PDF/DOCX in the private Supabase Storage bucket.
+        cloud_file_path = upload_resume_to_storage(saved_path, saved_filename)
 
         candidate = Candidate(
             id=candidate_id,
@@ -228,13 +332,14 @@ async def upload_resume(
             education=parsed.get("education", []),
             work_history=[],
             resume_file_name=original_filename,
-            file_path=str(saved_path),
+            file_path=cloud_file_path,
             extracted_text=parsed.get("extracted_text", ""),
             uploaded_at=datetime.now(timezone.utc)
         )
 
         db.add(candidate)
         db.commit()
+        candidate_committed = True
         db.refresh(candidate)
 
         add_system_notification(
@@ -255,18 +360,34 @@ async def upload_resume(
         }
 
     except HTTPException:
+        db.rollback()
+        if cloud_file_path and not candidate_committed:
+            try:
+                delete_resume_from_storage(cloud_file_path)
+            except Exception:
+                pass
         raise
+
     except Exception as error:
         db.rollback()
-        if saved_path.exists():
-            saved_path.unlink()
+        if cloud_file_path and not candidate_committed:
+            try:
+                delete_resume_from_storage(cloud_file_path)
+            except Exception:
+                pass
         raise HTTPException(
             status_code=500,
             detail=f"Resume processing failed: {str(error)}"
         )
-    finally:
-        await file.close()
 
+    finally:
+        # Render's local filesystem is temporary; remove the parsing copy.
+        if saved_path.exists():
+            try:
+                saved_path.unlink()
+            except OSError:
+                pass
+        await file.close()
 
 @app.get("/api/resumes/{candidate_id}/parse")
 def get_parsed_resume(
@@ -354,16 +475,18 @@ def delete_candidate(
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found.")
 
-    # Remove file from disk
+    # Remove the associated cloud object (or a legacy local file) first.
     if candidate.file_path:
-        file_p = Path(candidate.file_path)
-        if file_p.exists():
-            try:
-                file_p.unlink()
-            except Exception:
-                pass
+        try:
+            delete_resume_from_storage(candidate.file_path)
+        except Exception as error:
+            # Keep the candidate record if its stored resume could not be removed.
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not delete the associated resume file: {str(error)}"
+            )
 
-    # Delete matches
+    # Delete matches and candidate only after file deletion succeeds.
     db.query(Match).filter(Match.candidate_id == candidate_id).delete()
 
     candidate_name = candidate.name
@@ -381,7 +504,6 @@ def delete_candidate(
         "success": True,
         "message": f"Candidate {candidate_name} deleted successfully."
     }
-
 
 @app.post("/api/candidates/compare")
 def compare_candidates(

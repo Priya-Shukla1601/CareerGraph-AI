@@ -166,43 +166,132 @@ def extract_name(text: str, filename: str) -> str:
     return cleaned_stem if cleaned_stem else stem
 
 
+
 def extract_experience_years(text: str) -> float:
-    """Estimate years of experience from resume text."""
-    # Pattern 1: e.g. "3+ years of experience", "5 years experience", "4.5 yrs exp"
-    matches = re.findall(
-        r"(\d+(?:\.\d+)?)\+?\s*(?:years?|yrs?)(?:\s+of)?\s+(?:experience|exp)",
-        text,
-        re.IGNORECASE
-    )
-    if matches:
-        try:
-            exp_vals = [float(m) for m in matches if float(m) < 40]
-            if exp_vals:
-                return max(exp_vals)
-        except ValueError:
-            pass
+    """
+    Extract experience only from employment-related sections.
+    Ignore dates in education, projects, certifications and achievements.
+    """
 
-    # Pattern 2: Look for year spans like 2018 - 2023 or 2020 - Present
+    import re
+    from datetime import datetime
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    employment_headings = {
+        "experience",
+        "work experience",
+        "professional experience",
+        "employment history",
+        "work history",
+        "career history",
+        "professional background",
+    }
+
+    other_headings = {
+        "education",
+        "academic background",
+        "academic qualifications",
+        "skills",
+        "technical skills",
+        "skills and abilities",
+        "projects",
+        "personal projects",
+        "academic projects",
+        "certifications",
+        "certificates",
+        "certifications and achievements",
+        "achievements",
+        "awards",
+        "publications",
+        "interests",
+        "hobbies",
+        "references",
+    }
+
+    employment_lines = []
+    inside_employment_section = False
+
+    for line in lines:
+        heading = re.sub(r"[:\s]+$", "", line.lower()).strip()
+
+        if heading in employment_headings:
+            inside_employment_section = True
+            continue
+
+        if heading in other_headings:
+            inside_employment_section = False
+            continue
+
+        if inside_employment_section:
+            employment_lines.append(line)
+
+    employment_text = "\n".join(employment_lines)
+
+    if not employment_text:
+        return 0.0
+
+    # Explicit experience statements inside employment sections.
+    duration_matches = re.findall(
+        r"(\d+(?:\.\d+)?)\s*\+?\s*"
+        r"(?:years?|yrs?)\s*(?:of\s*)?"
+        r"(?:professional\s*)?(?:work\s*)?experience",
+        employment_text,
+        re.IGNORECASE,
+    )
+
+    if duration_matches:
+        values = [
+            float(value)
+            for value in duration_matches
+            if 0 <= float(value) <= 50
+        ]
+        if values:
+            return max(values)
+
+    # Extract employment date ranges only.
     year_spans = re.findall(
-        r"\b(20[0-2][0-9]|199[0-9])\s*[-–—to]+\s*(20[0-2][0-9]|present|current)\b",
-        text,
-        re.IGNORECASE
+        r"\b(19\d{2}|20\d{2})\s*"
+        r"(?:-|–|—|to)\s*"
+        r"(19\d{2}|20\d{2}|present|current)\b",
+        employment_text,
+        re.IGNORECASE,
     )
-    if year_spans:
-        total_years = 0
-        current_year = 2026
-        for start, end in year_spans:
-            try:
-                s_yr = int(start)
-                e_yr = current_year if end.lower() in ("present", "current") else int(end)
-                if 0 <= (e_yr - s_yr) <= 30:
-                    total_years += (e_yr - s_yr)
-            except ValueError:
-                continue
-        if total_years > 0:
-            return float(min(total_years, 30))
 
-    return 0.0
+    current_year = datetime.now().year
+    intervals = []
+
+    for start, end in year_spans:
+        start_year = int(start)
+        end_year = (
+            current_year
+            if end.lower() in {"present", "current"}
+            else int(end)
+        )
+
+        if start_year <= end_year <= current_year:
+            intervals.append((start_year, end_year))
+
+    if not intervals:
+        return 0.0
+
+    # Merge overlapping employment periods to avoid double counting.
+    intervals.sort()
+    merged = []
+
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (
+                merged[-1][0],
+                max(merged[-1][1], end),
+            )
+        else:
+            merged.append((start, end))
+
+    total_years = sum(end - start for start, end in merged)
+
+    return float(min(total_years, 50))
+
 
 
 def extract_education(text: str) -> List[Dict[str, Any]]:
